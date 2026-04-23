@@ -1,3 +1,4 @@
+mod bloom;
 mod db;
 mod memtable;
 mod sstable;
