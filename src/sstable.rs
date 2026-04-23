@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::bloom::BloomFilter;
+use crate::index::SparseIndex;
 
 /// Sentinel stored as the value when a key is deleted.
 /// `get()` returns this raw; `Db` layer converts it to `None`.
@@ -15,10 +16,15 @@ pub const TOMBSTONE: &str = "\x00TOMBSTONE";
 const BLOOM_BITS: usize = 8192;
 const BLOOM_HASHES: usize = 3;
 
+// Sample one index entry every N keys.
+// Smaller N = more index entries = faster seek, more memory.
+const SPARSE_INDEX_INTERVAL: usize = 4;
+
 pub struct SSTableManager {
     dir: String,
-    pub files: Vec<String>,           // .sst paths, oldest → newest
-    filters: Vec<BloomFilter>,        // one per file, same order
+    pub files: Vec<String>,    // .sst paths, oldest → newest
+    filters: Vec<BloomFilter>, // one per file, same order
+    indexes: Vec<SparseIndex>, // one per file, same order
     next_id: u64,
     pub compaction_threshold: usize,
 }
@@ -27,7 +33,6 @@ impl SSTableManager {
     pub fn new(dir: &str, compaction_threshold: usize) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
 
-        // Discover existing .sst files, sort by numeric ID
         let mut found: Vec<(u64, String)> = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -43,37 +48,46 @@ impl SSTableManager {
 
         let next_id = found.last().map(|(id, _)| id + 1).unwrap_or(0);
 
-        // Load companion bloom filter for each .sst file
         let mut files = Vec::new();
         let mut filters = Vec::new();
+        let mut indexes = Vec::new();
         for (_, sst_path) in found {
-            let bloom_path = bloom_path(&sst_path);
-            let filter = load_bloom(&bloom_path)?;
+            let filter = load_bloom(&bloom_path(&sst_path))?;
+            let index = SparseIndex::load(&index_path(&sst_path))?;
             files.push(sst_path);
             filters.push(filter);
+            indexes.push(index);
         }
 
-        Ok(SSTableManager { dir: dir.to_string(), files, filters, next_id, compaction_threshold })
+        Ok(SSTableManager { dir: dir.to_string(), files, filters, indexes, next_id, compaction_threshold })
     }
 
-    /// Write sorted entries to a new SSTable + companion bloom filter file.
+    /// Write sorted entries to a new SSTable + bloom filter + sparse index.
     pub fn flush(&mut self, entries: Vec<(String, String)>) -> io::Result<()> {
         let sst_path = format!("{}/sstable_{:08}.sst", self.dir, self.next_id);
-
-        // Build bloom filter from all keys in this flush
-        let mut filter = BloomFilter::new(BLOOM_BITS, BLOOM_HASHES);
         let mut file = OpenOptions::new().create(true).write(true).open(&sst_path)?;
-        for (k, v) in &entries {
+
+        let mut filter = BloomFilter::new(BLOOM_BITS, BLOOM_HASHES);
+        let mut index = SparseIndex::new();
+        let mut byte_offset: u64 = 0;
+
+        for (i, (k, v)) in entries.iter().enumerate() {
             filter.insert(k);
-            writeln!(file, "{},{}", k, v)?;
+            if i % SPARSE_INDEX_INTERVAL == 0 {
+                index.add(k.clone(), byte_offset);
+            }
+            let line = format!("{},{}\n", k, v);
+            byte_offset += line.len() as u64;
+            file.write_all(line.as_bytes())?;
         }
         file.flush()?;
 
-        // Persist bloom filter alongside the SSTable
         save_bloom(&bloom_path(&sst_path), &filter)?;
+        index.save(&index_path(&sst_path))?;
 
         self.files.push(sst_path);
         self.filters.push(filter);
+        self.indexes.push(index);
         self.next_id += 1;
         Ok(())
     }
@@ -82,16 +96,18 @@ impl SSTableManager {
         self.files.len() >= self.compaction_threshold
     }
 
-    /// Check bloom filter first — skip disk scan if key is definitely absent.
-    /// Returns None for both missing keys and tombstones (deletion is opaque to caller).
-    /// Scans newest → oldest so a tombstone in a newer file shadows an older value.
+    /// Bloom filter → index seek → short sorted scan (early-exit).
     pub fn get(&self, key: &str) -> io::Result<Option<String>> {
-        for (path, filter) in self.files.iter().zip(self.filters.iter()).rev() {
+        for ((path, filter), index) in self.files.iter()
+            .zip(self.filters.iter())
+            .zip(self.indexes.iter())
+            .rev()
+        {
             if !filter.contains(key) {
-                continue; // definitely not in this SSTable
+                continue; // definitely not here
             }
-            if let Some(v) = scan_file(path, key)? {
-                // Tombstone found — key is deleted; stop searching older files
+            let offset = index.find_offset(key);
+            if let Some(v) = scan_from(path, key, offset)? {
                 if v == TOMBSTONE { return Ok(None); }
                 return Ok(Some(v));
             }
@@ -99,7 +115,7 @@ impl SSTableManager {
         Ok(None)
     }
 
-    /// Merge all SSTables into one, deduplicating. Build new bloom filter. Delete old files.
+    /// Merge all SSTables, drop tombstones, rebuild bloom + index. Delete old files.
     pub fn compact(&mut self) -> io::Result<()> {
         let mut merged: BTreeMap<String, String> = BTreeMap::new();
 
@@ -115,34 +131,43 @@ impl SSTableManager {
             }
         }
 
-        // Write compacted SSTable — drop tombstones, they've served their purpose
         let new_sst = format!("{}/sstable_{:08}.sst", self.dir, self.next_id);
         let mut out = OpenOptions::new().create(true).write(true).open(&new_sst)?;
         let mut new_filter = BloomFilter::new(BLOOM_BITS, BLOOM_HASHES);
-        for (k, v) in &merged {
+        let mut new_index = SparseIndex::new();
+        let mut byte_offset: u64 = 0;
+
+        for (i, (k, v)) in merged.iter().enumerate() {
             if v == TOMBSTONE { continue; }
             new_filter.insert(k);
-            writeln!(out, "{},{}", k, v)?;
+            if i % SPARSE_INDEX_INTERVAL == 0 {
+                new_index.add(k.clone(), byte_offset);
+            }
+            let line = format!("{},{}\n", k, v);
+            byte_offset += line.len() as u64;
+            out.write_all(line.as_bytes())?;
         }
         out.flush()?;
-        save_bloom(&bloom_path(&new_sst), &new_filter)?;
 
-        // Delete old .sst and .bloom files
+        save_bloom(&bloom_path(&new_sst), &new_filter)?;
+        new_index.save(&index_path(&new_sst))?;
+
         for path in &self.files {
             fs::remove_file(path)?;
-            let _ = fs::remove_file(bloom_path(path)); // best-effort
+            let _ = fs::remove_file(bloom_path(path));
+            let _ = fs::remove_file(index_path(path));
         }
 
         self.next_id += 1;
         self.files = vec![new_sst];
         self.filters = vec![new_filter];
+        self.indexes = vec![new_index];
         Ok(())
     }
 }
 
-fn bloom_path(sst_path: &str) -> String {
-    sst_path.replace(".sst", ".bloom")
-}
+fn bloom_path(sst_path: &str) -> String { sst_path.replace(".sst", ".bloom") }
+fn index_path(sst_path: &str) -> String { sst_path.replace(".sst", ".index") }
 
 fn save_bloom(path: &str, filter: &BloomFilter) -> io::Result<()> {
     let mut f = OpenOptions::new().create(true).write(true).open(path)?;
@@ -152,7 +177,6 @@ fn save_bloom(path: &str, filter: &BloomFilter) -> io::Result<()> {
 
 fn load_bloom(path: &str) -> io::Result<BloomFilter> {
     if !Path::new(path).exists() {
-        // No bloom file — return an empty filter (all gets pass through to disk scan)
         return Ok(BloomFilter::new(BLOOM_BITS, BLOOM_HASHES));
     }
     let mut f = File::open(path)?;
@@ -161,22 +185,21 @@ fn load_bloom(path: &str) -> io::Result<BloomFilter> {
     Ok(BloomFilter::from_bytes(&bytes, BLOOM_BITS, BLOOM_HASHES))
 }
 
-fn scan_file(path: &str, key: &str) -> io::Result<Option<String>> {
-    if !Path::new(path).exists() {
-        return Ok(None);
-    }
-    let file = File::open(path)?;
+/// Seek to `offset` in the SSTable, scan forward.
+/// Early-exit when current key > target (file is sorted — target can't appear later).
+fn scan_from(path: &str, key: &str, offset: u64) -> io::Result<Option<String>> {
+    if !Path::new(path).exists() { return Ok(None); }
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
     let reader = BufReader::new(file);
-    let mut result = None;
     for line in reader.lines() {
         let line = line?;
         if let Some((k, v)) = line.split_once(',') {
-            if k == key {
-                result = Some(v.to_string());
-            }
+            if k == key { return Ok(Some(v.to_string())); }
+            if k > key  { return Ok(None); } // sorted: won't appear later
         }
     }
-    Ok(result)
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -244,8 +267,6 @@ mod tests {
         let dir = tmp("bloom_skip");
         let mut mgr = SSTableManager::new(&dir, 10).unwrap();
         mgr.flush(vec![("present".into(), "yes".into())]).unwrap();
-
-        // "absent" not inserted → bloom says no → scan_file never called
         assert_eq!(mgr.get("absent").unwrap(), None);
         assert_eq!(mgr.get("present").unwrap(), Some("yes".to_string()));
     }
@@ -257,25 +278,31 @@ mod tests {
             let mut mgr = SSTableManager::new(&dir, 10).unwrap();
             mgr.flush(vec![("k".into(), "v".into())]).unwrap();
         }
-        // Reopen — bloom filter loaded from .bloom file
         let mgr2 = SSTableManager::new(&dir, 10).unwrap();
         assert!(mgr2.filters[0].contains("k"));
         assert!(!mgr2.filters[0].contains("definitely_not_here"));
     }
 
     #[test]
+    fn bloom_filter_rebuilt_after_compaction() {
+        let dir = tmp("bloom_compact");
+        let mut mgr = SSTableManager::new(&dir, 10).unwrap();
+        mgr.flush(vec![("a".into(), "1".into())]).unwrap();
+        mgr.flush(vec![("b".into(), "2".into())]).unwrap();
+        mgr.compact().unwrap();
+        assert!(mgr.filters[0].contains("a"));
+        assert!(mgr.filters[0].contains("b"));
+        assert!(!mgr.filters[0].contains("z"));
+    }
+
+    #[test]
     fn tombstone_dropped_during_compaction() {
         let dir = tmp("tombstone_compact");
         let mut mgr = SSTableManager::new(&dir, 10).unwrap();
-        // Write a value, then a tombstone for the same key
         mgr.flush(vec![("k".into(), "v".into())]).unwrap();
         mgr.flush(vec![("k".into(), TOMBSTONE.into())]).unwrap();
         mgr.compact().unwrap();
-
-        // After compaction tombstone is gone — key returns None
         assert_eq!(mgr.get("k").unwrap(), None);
-
-        // Verify key is not in the compacted file at all
         let content = std::fs::read_to_string(&mgr.files[0]).unwrap();
         assert!(!content.contains("k,"));
     }
@@ -286,22 +313,53 @@ mod tests {
         let mut mgr = SSTableManager::new(&dir, 10).unwrap();
         mgr.flush(vec![("k".into(), "alive".into())]).unwrap();
         mgr.flush(vec![("k".into(), TOMBSTONE.into())]).unwrap();
-
-        // Newest file has tombstone → get returns None, not "alive"
         assert_eq!(mgr.get("k").unwrap(), None);
     }
 
     #[test]
-    fn bloom_filter_rebuilt_after_compaction() {
-        let dir = tmp("bloom_compact");
+    fn sparse_index_built_and_used() {
+        let dir = tmp("sparse_index");
         let mut mgr = SSTableManager::new(&dir, 10).unwrap();
-        mgr.flush(vec![("a".into(), "1".into())]).unwrap();
-        mgr.flush(vec![("b".into(), "2".into())]).unwrap();
-        mgr.compact().unwrap();
+        // 8 keys — index entries at positions 0 and 4 (interval=4)
+        let entries: Vec<(String, String)> = (0..8)
+            .map(|i| (format!("key{:02}", i), format!("val{}", i)))
+            .collect();
+        mgr.flush(entries).unwrap();
 
-        // Single compacted filter must contain both keys
-        assert!(mgr.filters[0].contains("a"));
-        assert!(mgr.filters[0].contains("b"));
-        assert!(!mgr.filters[0].contains("z"));
+        // All keys reachable via index seek
+        for i in 0..8 {
+            assert_eq!(
+                mgr.get(&format!("key{:02}", i)).unwrap(),
+                Some(format!("val{}", i))
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_index_survives_restart() {
+        let dir = tmp("index_restart");
+        {
+            let mut mgr = SSTableManager::new(&dir, 10).unwrap();
+            let entries: Vec<(String, String)> = (0..8)
+                .map(|i| (format!("k{:02}", i), format!("v{}", i)))
+                .collect();
+            mgr.flush(entries).unwrap();
+        }
+        let mgr2 = SSTableManager::new(&dir, 10).unwrap();
+        assert_eq!(mgr2.get("k05").unwrap(), Some("v5".to_string()));
+    }
+
+    #[test]
+    fn sparse_index_rebuilt_after_compaction() {
+        let dir = tmp("index_compact");
+        let mut mgr = SSTableManager::new(&dir, 10).unwrap();
+        mgr.flush(vec![("a".into(), "1".into()), ("b".into(), "2".into()),
+                       ("c".into(), "3".into()), ("d".into(), "4".into())]).unwrap();
+        mgr.flush(vec![("e".into(), "5".into())]).unwrap();
+        mgr.compact().unwrap();
+        // Index rebuilt — all keys still reachable
+        for (k, v) in [("a","1"),("b","2"),("c","3"),("d","4"),("e","5")] {
+            assert_eq!(mgr.get(k).unwrap(), Some(v.to_string()));
+        }
     }
 }

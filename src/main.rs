@@ -1,5 +1,6 @@
 mod bloom;
 mod db;
+mod index;
 mod memtable;
 mod sstable;
 mod wal;
