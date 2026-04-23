@@ -8,14 +8,22 @@ use db::Db;
 fn main() -> std::io::Result<()> {
     let mut store = Db::open("data")?;
 
-    store.set("name", "ahmed")?;
-    store.set("lang", "rust")?;
-    store.set("name", "nadeem")?; // overwrite — latest wins
-    store.set("city", "karachi")?; // 3rd unique key → triggers flush → SSTable written
+    // 9 writes → 3 flushes → 3 SSTable files
+    for i in 0..9 {
+        store.set(&format!("k{}", i), &format!("v{}", i))?;
+    }
 
-    println!("{:?}", store.get("name")?);    // Some("nadeem")
-    println!("{:?}", store.get("lang")?);    // Some("rust")
-    println!("{:?}", store.get("missing")?); // None
+    println!("SSTables before compact: {}", store.sstable_count());
+
+    // Compaction is now explicit — call it on a schedule, or when needs_compaction() is true
+    if store.needs_compaction() {
+        store.compact()?;
+    }
+
+    println!("SSTables after compact:  {}", store.sstable_count());
+    println!("{:?}", store.get("k0")?);
+    println!("{:?}", store.get("k8")?);
+    println!("{:?}", store.get("missing")?);
 
     Ok(())
 }

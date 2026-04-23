@@ -52,10 +52,11 @@ impl SSTableManager {
         self.files.push(path);
         self.next_id += 1;
 
-        if self.files.len() >= self.compaction_threshold {
-            self.compact()?;
-        }
         Ok(())
+    }
+
+    pub fn needs_compaction(&self) -> bool {
+        self.files.len() >= self.compaction_threshold
     }
 
     /// Check MemTable first, then scan SSTables newest → oldest. Returns first match.
@@ -69,7 +70,7 @@ impl SSTableManager {
     }
 
     /// Merge all SSTable files (oldest → newest) into one, deduplicating. Delete old files.
-    fn compact(&mut self) -> io::Result<()> {
+    pub fn compact(&mut self) -> io::Result<()> {
         let mut merged: BTreeMap<String, String> = BTreeMap::new();
 
         // Oldest → newest so newer writes overwrite older for same key
@@ -163,6 +164,7 @@ mod tests {
         mgr.flush(vec![("b".into(), "new".into()), ("c".into(), "3".into())]).unwrap();
         mgr.flush(vec![("d".into(), "4".into())]).unwrap();
 
+        mgr.compact().unwrap();
         assert_eq!(mgr.files.len(), 1);
         assert_eq!(mgr.get("a").unwrap(), Some("1".to_string()));
         assert_eq!(mgr.get("b").unwrap(), Some("new".to_string()));

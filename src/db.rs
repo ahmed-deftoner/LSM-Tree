@@ -46,6 +46,20 @@ impl Db {
         Ok(())
     }
 
+    pub fn sstable_count(&self) -> usize {
+        self.sstables.files.len()
+    }
+
+    /// Returns true when enough SSTables have accumulated to warrant compaction.
+    pub fn needs_compaction(&self) -> bool {
+        self.sstables.needs_compaction()
+    }
+
+    /// Merge all SSTables into one. Call this on a schedule or when needs_compaction() is true.
+    pub fn compact(&mut self) -> io::Result<()> {
+        self.sstables.compact()
+    }
+
     pub fn get(&self, key: &str) -> io::Result<Option<String>> {
         // Check hot MemTable first, then cold SSTables newest→oldest
         if let Some(v) = self.memtable.get(key) {
@@ -105,6 +119,7 @@ mod tests {
         for i in 0..9 {
             db.set(&format!("k{}", i), &format!("v{}", i)).unwrap();
         }
+        db.compact().unwrap();
         for i in 0..9 {
             assert_eq!(
                 db.get(&format!("k{}", i)).unwrap(),
