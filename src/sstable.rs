@@ -5,6 +5,11 @@ use std::path::Path;
 
 use crate::bloom::BloomFilter;
 
+/// Sentinel stored as the value when a key is deleted.
+/// `get()` returns this raw; `Db` layer converts it to `None`.
+/// `compact()` drops tombstone entries so deleted keys don't persist forever.
+pub const TOMBSTONE: &str = "\x00TOMBSTONE";
+
 // Bloom filter params: 8192 bits (~1KB per filter), 3 hash functions.
 // False positive rate ≈ 0.8% for up to 1000 keys.
 const BLOOM_BITS: usize = 8192;
@@ -78,12 +83,16 @@ impl SSTableManager {
     }
 
     /// Check bloom filter first — skip disk scan if key is definitely absent.
+    /// Returns None for both missing keys and tombstones (deletion is opaque to caller).
+    /// Scans newest → oldest so a tombstone in a newer file shadows an older value.
     pub fn get(&self, key: &str) -> io::Result<Option<String>> {
         for (path, filter) in self.files.iter().zip(self.filters.iter()).rev() {
             if !filter.contains(key) {
                 continue; // definitely not in this SSTable
             }
             if let Some(v) = scan_file(path, key)? {
+                // Tombstone found — key is deleted; stop searching older files
+                if v == TOMBSTONE { return Ok(None); }
                 return Ok(Some(v));
             }
         }
@@ -106,11 +115,12 @@ impl SSTableManager {
             }
         }
 
-        // Write compacted SSTable
+        // Write compacted SSTable — drop tombstones, they've served their purpose
         let new_sst = format!("{}/sstable_{:08}.sst", self.dir, self.next_id);
         let mut out = OpenOptions::new().create(true).write(true).open(&new_sst)?;
         let mut new_filter = BloomFilter::new(BLOOM_BITS, BLOOM_HASHES);
         for (k, v) in &merged {
+            if v == TOMBSTONE { continue; }
             new_filter.insert(k);
             writeln!(out, "{},{}", k, v)?;
         }
@@ -251,6 +261,34 @@ mod tests {
         let mgr2 = SSTableManager::new(&dir, 10).unwrap();
         assert!(mgr2.filters[0].contains("k"));
         assert!(!mgr2.filters[0].contains("definitely_not_here"));
+    }
+
+    #[test]
+    fn tombstone_dropped_during_compaction() {
+        let dir = tmp("tombstone_compact");
+        let mut mgr = SSTableManager::new(&dir, 10).unwrap();
+        // Write a value, then a tombstone for the same key
+        mgr.flush(vec![("k".into(), "v".into())]).unwrap();
+        mgr.flush(vec![("k".into(), TOMBSTONE.into())]).unwrap();
+        mgr.compact().unwrap();
+
+        // After compaction tombstone is gone — key returns None
+        assert_eq!(mgr.get("k").unwrap(), None);
+
+        // Verify key is not in the compacted file at all
+        let content = std::fs::read_to_string(&mgr.files[0]).unwrap();
+        assert!(!content.contains("k,"));
+    }
+
+    #[test]
+    fn tombstone_in_newer_file_shadows_older_value() {
+        let dir = tmp("tombstone_shadow");
+        let mut mgr = SSTableManager::new(&dir, 10).unwrap();
+        mgr.flush(vec![("k".into(), "alive".into())]).unwrap();
+        mgr.flush(vec![("k".into(), TOMBSTONE.into())]).unwrap();
+
+        // Newest file has tombstone → get returns None, not "alive"
+        assert_eq!(mgr.get("k").unwrap(), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::io;
 use crate::memtable::MemTable;
-use crate::sstable::SSTableManager;
+use crate::sstable::{SSTableManager, TOMBSTONE};
 use crate::wal::Wal;
 
 const MEMTABLE_THRESHOLD: usize = 3;
@@ -60,12 +60,20 @@ impl Db {
         self.sstables.compact()
     }
 
+    /// Write a tombstone for `key`. Subsequent `get()` returns `None`.
+    /// Tombstone is removed from disk permanently during the next compaction.
+    pub fn delete(&mut self, key: &str) -> io::Result<()> {
+        self.set(key, TOMBSTONE)
+    }
+
     pub fn get(&self, key: &str) -> io::Result<Option<String>> {
-        // Check hot MemTable first, then cold SSTables newest→oldest
+        // Check hot MemTable first, then cold SSTables newest→oldest.
+        // A tombstone in either layer means the key is deleted — return None.
         if let Some(v) = self.memtable.get(key) {
+            if v == TOMBSTONE { return Ok(None); }
             return Ok(Some(v.clone()));
         }
-        self.sstables.get(key)
+        self.sstables.get(key) // sstable::get already handles tombstones
     }
 }
 
@@ -127,6 +135,47 @@ mod tests {
             );
         }
         assert_eq!(db.sstables.files.len(), 1);
+    }
+
+    #[test]
+    fn delete_in_memtable() {
+        let dir = tmp("del_mem");
+        let mut db = Db::open(&dir).unwrap();
+        db.set("k", "v").unwrap();
+        db.delete("k").unwrap();
+        assert_eq!(db.get("k").unwrap(), None);
+    }
+
+    #[test]
+    fn delete_after_flush_shadows_sstable() {
+        let dir = tmp("del_shadow");
+        let mut db = Db::open(&dir).unwrap();
+        // Flush "k" to SSTable
+        db.set("a", "1").unwrap();
+        db.set("b", "2").unwrap();
+        db.set("k", "alive").unwrap(); // triggers flush
+        // Now delete "k" — tombstone lives in MemTable
+        db.delete("k").unwrap();
+        assert_eq!(db.get("k").unwrap(), None);
+    }
+
+    #[test]
+    fn delete_cleared_after_compaction() {
+        let dir = tmp("del_compact");
+        let mut db = Db::open(&dir).unwrap();
+        // Write and delete enough to trigger multiple flushes
+        for i in 0..3 {
+            db.set(&format!("k{}", i), "v").unwrap();
+        }
+        // k0 is now in SSTable; delete it (tombstone flushes with next batch)
+        for i in 0..3 {
+            db.delete(&format!("k{}", i)).unwrap();
+        }
+        db.compact().unwrap();
+        // After compaction, tombstones are gone — keys return None
+        for i in 0..3 {
+            assert_eq!(db.get(&format!("k{}", i)).unwrap(), None);
+        }
     }
 
     #[test]
