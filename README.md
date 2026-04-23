@@ -1,4 +1,4 @@
-# LSM Tree — Learning Implementation
+# LSM Tree Impl
 
 A Log-Structured Merge Tree key-value store built in Rust from scratch. No external dependencies.
 
